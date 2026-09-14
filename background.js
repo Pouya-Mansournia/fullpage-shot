@@ -12,25 +12,104 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 async function captureFullPage(tabId) {
   const [{ result: prep }] = await chrome.scripting.executeScript({
     target: { tabId },
-    func: findScrollTargetAndPositions,
+    func: findScrollTarget,
     args: [MAX_HEIGHT],
   });
   if (!prep) throw new Error("Could not find any content to capture on this page.");
 
+  const { mode, dpr } = prep;
+  const width = prep.width;
+  let height = prep.height;
+  let totalHeight = Math.min(prep.totalHeight, MAX_HEIGHT);
+  let step = Math.max(150, height - 60);
+
   const shots = [];
-  for (const pos of prep.positions) {
-    await chrome.scripting.executeScript({
+  let pos = 0;
+  const maxIterations = Math.ceil(MAX_HEIGHT / step) + 20;
+
+  for (let i = 0; i < maxIterations; i++) {
+    const scrollTarget = Math.min(pos, Math.max(0, totalHeight - height));
+    const [{ result: measured }] = await chrome.scripting.executeScript({
       target: { tabId },
       func: scrollToPosition,
-      args: [prep.mode, pos],
+      args: [mode, scrollTarget],
     });
     await sleep(400);
     const dataUrl = await chrome.tabs.captureVisibleTab(undefined, { format: "png" });
-    shots.push({ pos, dataUrl });
+    // The crop rect is re-measured after every scroll (not just once up
+    // front) because some sites collapse/resize a sticky header as you
+    // scroll, which shifts where the scrollable content sits on screen.
+    shots.push({
+      pos: measured.actualPos,
+      dataUrl,
+      x: measured.x,
+      y: measured.y,
+      width: measured.width,
+      height: measured.height,
+    });
     await sleep(150); // stay under captureVisibleTab's rate limit
+
+    height = measured.height;
+    step = Math.max(150, height - 60);
+
+    if (measured.totalHeight > totalHeight) {
+      totalHeight = Math.min(measured.totalHeight, MAX_HEIGHT);
+    }
+
+    const reachedBottom = measured.actualPos + height >= totalHeight - 1;
+    if (!reachedBottom) {
+      pos = measured.actualPos + step;
+      continue;
+    }
+
+    // Give lazy-loaded content (common on infinite-scroll pages) a chance to
+    // arrive — some sites fetch the next batch slowly, so keep checking a
+    // few times before concluding the page is really done growing.
+    let grew = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await sleep(700);
+      const [{ result: recheck }] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: measureHeight,
+        args: [mode],
+      });
+      if (recheck.totalHeight > totalHeight + 5) {
+        totalHeight = Math.min(recheck.totalHeight, MAX_HEIGHT);
+        grew = true;
+        break;
+      }
+    }
+    if (grew) {
+      pos = measured.actualPos + step;
+      continue;
+    }
+    break;
   }
 
-  const finalDataUrl = await stitch(shots, prep);
+  // Append any fixed/sticky bottom bar (e.g. a bottom nav) once, at the very
+  // end — it's chrome, not scrollable content, so it's deliberately excluded
+  // from every mid-page shot to avoid it repeating down the whole image.
+  if (shots.length) {
+    const [{ result: footer }] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: findFixedBottomBar,
+      args: [],
+    });
+    if (footer) {
+      const last = shots[shots.length - 1];
+      shots.push({
+        pos: totalHeight,
+        dataUrl: last.dataUrl,
+        x: last.x,
+        y: footer.y,
+        width: last.width,
+        height: footer.height,
+      });
+      totalHeight += footer.height;
+    }
+  }
+
+  const finalDataUrl = await stitch(shots, { width, totalHeight, dpr });
   await chrome.downloads.download({
     url: finalDataUrl,
     filename: "fullpage-shot.png",
@@ -43,17 +122,17 @@ function sleep(ms) {
 }
 
 async function stitch(shots, prep) {
-  const { x, y, width, height, totalHeight, dpr } = prep;
+  const { width, totalHeight, dpr } = prep;
   const canvas = new OffscreenCanvas(Math.round(width * dpr), Math.round(totalHeight * dpr));
   const ctx = canvas.getContext("2d");
 
-  for (const { pos, dataUrl } of shots) {
+  for (const { pos, dataUrl, x, y, width: shotWidth, height: shotHeight } of shots) {
     const blob = await (await fetch(dataUrl)).blob();
     const bitmap = await createImageBitmap(blob);
     const sx = Math.round(x * dpr);
     const sy = Math.round(y * dpr);
-    const sw = Math.round(width * dpr);
-    const sh = Math.round(height * dpr);
+    const sw = Math.round(shotWidth * dpr);
+    const sh = Math.round(shotHeight * dpr);
     ctx.drawImage(bitmap, sx, sy, sw, sh, 0, Math.round(pos * dpr), sw, sh);
   }
 
@@ -73,7 +152,7 @@ function blobToDataURL(blob) {
 // --- Functions below are injected into the page via chrome.scripting.executeScript. ---
 // They must be fully self-contained (no references to outer scope).
 
-function findScrollTargetAndPositions(maxHeight) {
+function findScrollTarget(maxHeight) {
   const vw = innerWidth;
   const vh = innerHeight;
   const dpr = window.devicePixelRatio || 1;
@@ -97,43 +176,93 @@ function findScrollTargetAndPositions(maxHeight) {
   }
   candidates.sort((a, b) => b.score - a.score);
 
+  const windowTotalHeight = Math.max(
+    document.documentElement.scrollHeight,
+    document.body.scrollHeight
+  );
+  const windowScrollable = windowTotalHeight > vh + 30;
+
   let mode, x = 0, y = 0, width = vw, height = vh, totalHeight;
   if (candidates.length) {
     const target = candidates[0].el;
-    target.setAttribute("data-fps-target", "1");
-    const r = target.getBoundingClientRect();
-    mode = "container";
-    x = Math.max(0, r.x);
-    y = Math.max(0, r.y);
-    width = r.width;
-    height = r.height;
-    totalHeight = Math.min(target.scrollHeight, maxHeight);
+    const containerTotalHeight = target.scrollHeight;
+    // The whole document can genuinely cover more content than the detected
+    // inner container (e.g. the heuristic locked onto the wrong scrollable
+    // panel) — prefer whichever actually spans more of the page.
+    if (windowScrollable && windowTotalHeight >= containerTotalHeight) {
+      mode = "window";
+      totalHeight = Math.min(windowTotalHeight, maxHeight);
+    } else {
+      target.setAttribute("data-fps-target", "1");
+      const r = target.getBoundingClientRect();
+      mode = "container";
+      x = Math.max(0, r.x);
+      y = Math.max(0, r.y);
+      width = r.width;
+      height = r.height;
+      totalHeight = Math.min(containerTotalHeight, maxHeight);
+    }
   } else {
     mode = "window";
-    totalHeight = Math.min(
-      Math.max(document.documentElement.scrollHeight, document.body.scrollHeight),
-      maxHeight
-    );
+    totalHeight = Math.min(windowTotalHeight, maxHeight);
   }
 
-  const step = Math.max(150, height - 60);
-  const positions = [];
-  for (let p = 0; p < Math.max(1, totalHeight - height + 1); p += step) {
-    positions.push(Math.round(p));
-  }
-  const last = Math.max(0, Math.round(totalHeight - height));
-  if (!positions.length || positions[positions.length - 1] !== last) {
-    positions.push(last);
+  return { mode, x, y, width, height, totalHeight, dpr };
+}
+
+function findFixedBottomBar() {
+  const vw = innerWidth;
+  const vh = innerHeight;
+  const els = [...document.querySelectorAll("*")];
+  let best = null;
+
+  for (const el of els) {
+    const s = getComputedStyle(el);
+    if (s.position !== "fixed" && s.position !== "sticky") continue;
+    const r = el.getBoundingClientRect();
+    if (r.height < 20 || r.height > vh * 0.4) continue;
+    if (r.width < vw * 0.3) continue;
+    if (r.bottom < vh - 40) continue; // must be anchored near the viewport bottom
+    const area = r.width * r.height;
+    if (!best || area > best.area) {
+      best = { area, y: Math.max(0, r.y), height: r.height };
+    }
   }
 
-  return { mode, x, y, width, height, totalHeight, positions, dpr };
+  return best ? { y: best.y, height: best.height } : null;
+}
+
+function measureHeight(mode) {
+  if (mode === "container") {
+    const el = document.querySelector('[data-fps-target="1"]');
+    return { totalHeight: el ? el.scrollHeight : document.documentElement.scrollHeight };
+  }
+  return {
+    totalHeight: Math.max(document.documentElement.scrollHeight, document.body.scrollHeight),
+  };
 }
 
 function scrollToPosition(mode, pos) {
   if (mode === "container") {
     const el = document.querySelector('[data-fps-target="1"]');
     if (el) el.scrollTop = pos;
-  } else {
-    window.scrollTo(0, pos);
+    const r = el ? el.getBoundingClientRect() : null;
+    return {
+      actualPos: el ? el.scrollTop : pos,
+      totalHeight: el ? el.scrollHeight : document.documentElement.scrollHeight,
+      x: r ? Math.max(0, r.x) : 0,
+      y: r ? Math.max(0, r.y) : 0,
+      width: r ? r.width : innerWidth,
+      height: r ? r.height : innerHeight,
+    };
   }
+  window.scrollTo(0, pos);
+  return {
+    actualPos: window.scrollY,
+    totalHeight: Math.max(document.documentElement.scrollHeight, document.body.scrollHeight),
+    x: 0,
+    y: 0,
+    width: innerWidth,
+    height: innerHeight,
+  };
 }
