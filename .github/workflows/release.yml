@@ -1,0 +1,24 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches manifest version
+        run: |
+          VERSION=$(jq -r .version manifest.json)
+          [ "v$VERSION" = "$GITHUB_REF_NAME" ] || { echo "Tag $GITHUB_REF_NAME does not match manifest version $VERSION"; exit 1; }
+      - name: Build zip
+        run: echo "ZIP=$(./scripts/build.sh)" >> "$GITHUB_ENV"
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "$ZIP" --title "$GITHUB_REF_NAME" --generate-notes

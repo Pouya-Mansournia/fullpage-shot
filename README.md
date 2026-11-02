@@ -8,7 +8,11 @@
   A Chrome extension that captures a full page screenshot of the current tab, including SPA style pages with internal scroll containers, using your own logged in session.
 </p>
 
-## Quick install
+## Install
+
+Install from the Chrome Web Store (updates install automatically), or download the zip from the [latest release](https://github.com/Pouya-Mansournia/fullpage-shot/releases/latest).
+
+### Load from source
 
 1. Download or clone this repository.
 2. Open `chrome://extensions` in Chrome.
@@ -46,6 +50,19 @@ No content script is declared in the manifest and no broad host permissions are 
 - Very tall pages are capped at 20,000 px to keep memory usage reasonable.
 - Some pages use a location or cookie modal on first load that can end up in the screenshot if it is still open when you capture. Close it first for a cleaner result.
 - `chrome.tabs.captureVisibleTab` has a short rate limit, which is why capture of very long pages takes a few seconds per section.
+
+## Releasing
+
+1. Bump `version` in `manifest.json` and commit.
+2. Tag and push: `git tag v1.2.3 && git push origin v1.2.3`.
+3. GitHub Actions builds the zip and creates a release.
+4. Upload that zip in the Chrome Web Store developer dashboard. Installed users update automatically.
+
+Build locally with `./scripts/build.sh` (output goes to `dist/`).
+
+## Privacy
+
+See [PRIVACY.md](PRIVACY.md).
 
 ## License
 
